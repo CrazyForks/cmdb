@@ -185,7 +185,16 @@ const genCmdbRoutes = async () => {
     }
   }
 
-  return routes
+  return [
+    routes,
+    {
+      path: '/cmdb/mobile/:typeId/:ciId',
+      name: 'cmdb_mobile_detail',
+      hidden: true,
+      meta: { title: 'cmdb.ci.mobileDetail' },
+      component: () => import('../views/mobile/CIMobileDetail.vue'),
+    }
+  ]
 }
 
 export default genCmdbRoutes
