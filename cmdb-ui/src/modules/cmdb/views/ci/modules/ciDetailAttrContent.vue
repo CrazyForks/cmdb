@@ -375,6 +375,7 @@ export default {
 
 <style lang="less" scoped>
 .ci-detail-attr-preview {
+  width: calc(100% - 28px);
   white-space: pre-wrap;
 }
 
