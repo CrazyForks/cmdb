@@ -556,6 +556,14 @@ class AutoDiscoveryCICRUD(DBMixin):
         return cls.cls.get_by(adt_id=adt_id, to_dict=False)
 
     @classmethod
+    def get_instances_by_adt_id(cls, adt_id):
+        if not AutoDiscoveryCIType.get_by_id(adt_id):
+            return []
+
+        instances = cls.cls.get_by(adt_id=adt_id, to_dict=False, fl=['unique_value'])
+        return [instance.unique_value for instance in instances]
+
+    @classmethod
     def get_type_name(cls, adc_id):
         adc = cls.cls.get_by_id(adc_id) or abort(404, ErrFormat.adc_not_found)
 

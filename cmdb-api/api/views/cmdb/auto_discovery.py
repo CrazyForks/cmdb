@@ -268,6 +268,13 @@ class AutoDiscoveryCIAcceptView(APIView):
         return self.jsonify(adc_id=adc_id)
 
 
+class AutoDiscoveryCIByAdtView(APIView):
+    url_prefix = "/adcs/adt/<int:adt_id>"
+
+    def get(self, adt_id):
+        return self.jsonify(instances=AutoDiscoveryCICRUD.get_instances_by_adt_id(adt_id))
+
+
 class AutoDiscoveryRuleSyncView(APIView):
     url_prefix = ("/adt/sync",)
 
@@ -277,7 +284,9 @@ class AutoDiscoveryRuleSyncView(APIView):
 
         oneagent_name = request.values.get('oneagent_name')
         oneagent_id = request.values.get('oneagent_id')
-        last_update_at = request.values.get('last_update_at')
+        legacy_last_update_at = request.values.get('last_update_at')
+        ad_last_update_at = request.values.get('ad_last_update_at') or legacy_last_update_at
+        ipam_last_update_at = request.values.get('ipam_last_update_at') or legacy_last_update_at
 
         response = []
         if AttributeCache.get('oneagent_id'):
@@ -290,23 +299,26 @@ class AutoDiscoveryRuleSyncView(APIView):
                 current_app.logger.error(traceback.format_exc())
                 return abort(400, str(e))
 
+        ci_id = None
         for res in response:
             if res.get('{}_name'.format(res['ci_type'])) == oneagent_name or oneagent_name == res.get('oneagent_name'):
                 ci_id = res["_id"]
-                rules, last_update_at = AutoDiscoveryCITypeCRUD.get(ci_id, oneagent_id, oneagent_name, last_update_at)
+                break
 
-                return self.jsonify(rules=rules, last_update_at=last_update_at)
-
-        rules, last_update_at1 = AutoDiscoveryCITypeCRUD.get(None, oneagent_id, oneagent_name, last_update_at)
+        rules, ad_last_update_at_new = AutoDiscoveryCITypeCRUD.get(
+            ci_id, oneagent_id, oneagent_name, ad_last_update_at)
 
         try:
-            subnet_scan_rules, last_update_at2 = SubnetManager().scan_rules(oneagent_id, last_update_at)
+            subnet_scan_rules, ipam_last_update_at_new = SubnetManager().scan_rules(
+                oneagent_id, ipam_last_update_at)
         except AbortException:
-            subnet_scan_rules, last_update_at2 = [], ""
+            subnet_scan_rules, ipam_last_update_at_new = [], ""
 
         return self.jsonify(rules=rules,
                             subnet_scan_rules=subnet_scan_rules,
-                            last_update_at=max(last_update_at1 or "", last_update_at2 or ""))
+                            ad_last_update_at=ad_last_update_at_new,
+                            ipam_last_update_at=ipam_last_update_at_new,
+                            last_update_at=max(ad_last_update_at_new or "", ipam_last_update_at_new or ""))
 
 
 class AutoDiscoveryRuleSyncHistoryView(APIView):

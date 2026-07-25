@@ -11,9 +11,11 @@ from api.lib.cmdb.cache import CITypeCache
 from api.lib.cmdb.ci import CIManager
 from api.lib.cmdb.ci import CIRelationManager
 from api.lib.cmdb.const import BuiltinModelEnum
+from api.lib.cmdb.custom_dashboard import SystemConfigManager
 from api.lib.cmdb.ipam.const import OperateTypeEnum
 from api.lib.cmdb.ipam.const import SubnetBuiltinAttributes
 from api.lib.cmdb.ipam.history import OperateHistoryManager
+from api.lib.cmdb.ipam.history import ScanHistoryManager
 from api.lib.cmdb.resp_format import ErrFormat
 from api.lib.cmdb.search.ci.db.search import Search as SearchFromDB
 from api.models.cmdb import CI
@@ -22,6 +24,9 @@ from api.models.cmdb import IPAMSubnetScan
 
 
 class SubnetManager(object):
+    SCAN_RULES_UPDATED_AT = 'ipam_rules_updated_at'
+    MAX_SCAN_RESULT_ENTRIES = 65536
+
     def __init__(self):
         self.ci_type = CITypeCache.get(BuiltinModelEnum.IPAM_SUBNET) or abort(
             404, ErrFormat.ipam_subnet_model_not_found.format(BuiltinModelEnum.IPAM_SUBNET))
@@ -33,7 +38,7 @@ class SubnetManager(object):
     def scan_rules(self, oneagent_id, last_update_at=None):
         result = []
         rules = IPAMSubnetScan.get_by(agent_id=oneagent_id, to_dict=True)
-        ci_ids = [i['ci_id'] for i in rules]
+        ci_ids = [i['ci_id'] for i in rules if i.get('scan_enabled')]
         if ci_ids:
             response, _, _, _, _, _ = SearchFromDB("_type:{}".format(self.type_id),
                                                    ci_ids=list(ci_ids),
@@ -43,20 +48,103 @@ class SubnetManager(object):
             id2ci = {i['_id']: i for i in response}
 
             for rule in rules:
-                if rule['ci_id'] in id2ci:
-                    rule[SubnetBuiltinAttributes.CIDR] = id2ci[rule['ci_id']][SubnetBuiltinAttributes.CIDR]
-                    result.append(rule)
+                if not rule.get('scan_enabled') or rule['ci_id'] not in id2ci:
+                    continue
+                result.append({
+                    'rule_id': rule['id'],
+                    'rule_name': 'subnet_{}'.format(rule['ci_id']),
+                    'agent_id': rule['agent_id'],
+                    'cron': rule['cron'],
+                    'max_concurrent': 1,
+                    'scan_enabled': True,
+                    'ping_enabled': True,
+                    'port_scan_enabled': False,
+                    'port_list': [],
+                    'scan_mode': 'active',
+                    'subnets': [{
+                        'ci_id': rule['ci_id'],
+                        'cidr': id2ci[rule['ci_id']][SubnetBuiltinAttributes.CIDR],
+                    }],
+                    'rule_updated_at': rule['rule_updated_at'],
+                    'created_at': rule['created_at'],
+                })
 
-        new_last_update_at = ""
-        for i in result:
-            __last_update_at = max([i['rule_updated_at'] or "", i['created_at'] or ""])
-            if new_last_update_at < __last_update_at:
-                new_last_update_at = __last_update_at
+        new_last_update_at = (SystemConfigManager.get(self.SCAN_RULES_UPDATED_AT) or {}).get(
+            'option', {}).get('v') or ""
+        for rule in rules:
+            new_last_update_at = max(
+                new_last_update_at, rule.get('rule_updated_at') or "", rule.get('created_at') or "")
 
         if not last_update_at or new_last_update_at > last_update_at:
             return result, new_last_update_at
         else:
             return [], new_last_update_at
+
+    @classmethod
+    def _touch_scan_rules(cls):
+        SystemConfigManager.create_or_update(
+            cls.SCAN_RULES_UPDATED_AT,
+            dict(v=datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+
+    def save_scan_results(self, rule_id, exec_id, scan_results, start_at=None,
+                          end_at=None, status=0, stdout=None):
+        if not isinstance(scan_results, dict):
+            return abort(400, 'Invalid subnet scan results')
+
+        rule = IPAMSubnetScan.get_by_id(rule_id)
+        if rule is None:
+            return abort(404, 'Subnet scan rule {} not found'.format(rule_id))
+
+        result = scan_results.get(str(rule.ci_id))
+        if not isinstance(result, dict) or len(scan_results) != 1:
+            return abort(400, 'Subnet scan result does not match rule {}'.format(rule_id))
+
+        response, _, _, _, _, _ = SearchFromDB(
+            "_type:{}".format(self.type_id),
+            ci_ids=[rule.ci_id],
+            count=1,
+            fl=[SubnetBuiltinAttributes.CIDR],
+            parent_node_perm_passed=True).search()
+        if not response:
+            return abort(400, 'Subnet for scan rule {} not found'.format(rule_id))
+
+        expected_cidr = response[0][SubnetBuiltinAttributes.CIDR]
+        submitted_cidr = result.get('cidr') or expected_cidr
+        try:
+            network = ipaddress.ip_network(expected_cidr)
+            if ipaddress.ip_network(submitted_cidr) != network:
+                return abort(400, 'Subnet scan result CIDR does not match rule')
+        except (TypeError, ValueError):
+            return abort(400, 'Invalid subnet scan result CIDR')
+
+        active_ips = result.get('active_ips') or []
+        if not isinstance(active_ips, list) or len(active_ips) > self.MAX_SCAN_RESULT_ENTRIES:
+            return abort(400, 'Invalid subnet scan active IPs')
+        try:
+            if any(ipaddress.ip_address(ip) not in network for ip in active_ips):
+                return abort(400, 'Subnet scan result contains an IP outside the subnet')
+        except (TypeError, ValueError):
+            return abort(400, 'Subnet scan result contains an invalid IP')
+
+        try:
+            result_status = int(result.get('status', status))
+            request_status = int(status)
+        except (TypeError, ValueError):
+            return abort(400, 'Invalid subnet scan result status')
+        if request_status != 0:
+            result_status = request_status
+        saved_ips = active_ips if result_status == 0 else []
+        ScanHistoryManager().add(
+            subnet_scan_id=rule.id,
+            exec_id=exec_id,
+            ci_id=rule.ci_id,
+            cidr=expected_cidr,
+            start_at=start_at,
+            end_at=end_at,
+            status=result_status,
+            stdout=result.get('error') or stdout,
+            ip_num=len(saved_ips),
+            ips=saved_ips)
 
     @staticmethod
     def get_hosts(cidr):
@@ -217,6 +305,7 @@ class SubnetManager(object):
     @staticmethod
     def _add_scan_rule(ci_id, agent_id, cron, scan_enabled=True):
         IPAMSubnetScan.create(ci_id=ci_id, agent_id=agent_id, cron=cron, scan_enabled=scan_enabled)
+        SubnetManager._touch_scan_rules()
 
     @staticmethod
     def _add_relation(parent_id, child_id):
@@ -252,6 +341,7 @@ class SubnetManager(object):
                            rule_updated_at=datetime.datetime.now())
         else:
             IPAMSubnetScan.create(ci_id=ci_id, agent_id=agent_id, cron=cron, scan_enabled=scan_enabled)
+        SubnetManager._touch_scan_rules()
 
     def update(self, _id, **kwargs):
         kwargs[SubnetBuiltinAttributes.CIDR] = self.validate_cidr(kwargs.pop('parent_id', None),
@@ -341,6 +431,7 @@ class SubnetManager(object):
 
         existed = IPAMSubnetScan.get_by(ci_id=_id, first=True, to_dict=False)
         existed and existed.delete()
+        existed and cls._touch_scan_rules()
 
         delete_ci_ids = []
         for i in CIRelation.get_by(first_ci_id=_id, to_dict=False):

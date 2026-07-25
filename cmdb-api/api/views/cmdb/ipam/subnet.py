@@ -60,6 +60,24 @@ class SubnetMoveView(APIView):
         return self.jsonify(id=SubnetManager().move(_id, request.values.get('target_parent_id')))
 
 
+class SubnetScanHistoryView(APIView):
+    url_prefix = "/ipam/subnet/scan_history"
+
+    @args_required("rule_id")
+    @args_required("exec_id")
+    @args_required("scan_results")
+    def post(self):
+        SubnetManager().save_scan_results(
+            int(request.values.get('rule_id')),
+            request.values.get('exec_id'),
+            request.values.get('scan_results'),
+            start_at=request.values.get('start_at'),
+            end_at=request.values.get('end_at'),
+            status=int(request.values.get('status', 0)),
+            stdout=request.values.get('stdout'))
+        return self.jsonify(code=200, message="Scan results saved successfully")
+
+
 class SubnetScopeView(APIView):
     url_prefix = ("/ipam/scope", "/ipam/scope/<int:_id>")
 
