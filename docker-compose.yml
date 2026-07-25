@@ -106,7 +106,7 @@ services:
     networks:
       - new
     ports:
-      - "8077:80"
+      - "8000:80"
 
 volumes:
   db-data:
